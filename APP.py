@@ -28,16 +28,25 @@ if GEMINI_API_KEY and GEMINI_API_KEY != "PASTE_YOUR_GEMINI_API_KEY_HERE":
     gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
 # ─── Fix Yahoo Finance Rate Limiting on Cloud ────────────
-# Create a custom session with browser-like headers to avoid IP blocks
-_yf_session = requests.Session()
-_yf_session.headers.update({
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-    'Accept-Language': 'en-US,en;q=0.5',
-    'Accept-Encoding': 'gzip, deflate, br',
-    'Connection': 'keep-alive',
-    'Upgrade-Insecure-Requests': '1',
-})
+# Monkey-patch yfinance's internal user-agent to look like a real browser
+# This avoids Streamlit Cloud IP blocks without using session= parameter
+_BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+try:
+    import yfinance.utils as _yf_utils
+    _yf_utils.user_agent_headers = {'User-Agent': _BROWSER_UA}
+except Exception:
+    pass
+try:
+    import yfinance.data as _yf_data
+    if hasattr(_yf_data, 'YfData'):
+        _orig_init = _yf_data.YfData.__init__
+        def _patched_init(self, *args, **kwargs):
+            _orig_init(self, *args, **kwargs)
+            if hasattr(self, '_session') and self._session:
+                self._session.headers.update({'User-Agent': _BROWSER_UA})
+        _yf_data.YfData.__init__ = _patched_init
+except Exception:
+    pass
 
 # ─── Page Config ──────────────────────────────────────────
 st.set_page_config(page_title="AI Stock Analyzer", layout="wide", page_icon="📈")
@@ -204,7 +213,7 @@ def safe_download(ticker_sym, start, end, max_retries=3):
     """Safely call yf.download with retry logic."""
     for attempt in range(max_retries):
         try:
-            df = yf.download(ticker_sym, start=start, end=end, auto_adjust=True, session=_yf_session)
+            df = yf.download(ticker_sym, start=start, end=end, auto_adjust=True)
             if df is not None and not df.empty:
                 return df
         except Exception as e:
@@ -244,7 +253,7 @@ def get_ticker(company):
 
         # Fallback: try direct ticker lookup
         if not results:
-            test = yf.Ticker(company.upper().replace(" ", ""), session=_yf_session)
+            test = yf.Ticker(company.upper().replace(" ", ""))
             fallback_info = safe_get_info(test)
             if fallback_info.get('symbol'):
                 return fallback_info['symbol'], fallback_info.get('shortName', company)
@@ -276,7 +285,7 @@ def fetch_news_headlines(company_name, ticker_sym):
     """Fetch recent news headlines for the company."""
     headlines = []
     try:
-        stock = yf.Ticker(ticker_sym, session=_yf_session)
+        stock = yf.Ticker(ticker_sym)
         news = stock.news if hasattr(stock, 'news') else []
         if news:
             for item in news[:8]:
@@ -321,7 +330,7 @@ def fetch_news_headlines(company_name, ticker_sym):
 @st.cache_data(ttl=300, show_spinner=False)
 def get_financial_details(ticker_sym):
     """Fetch deep financial data for agentic analysis."""
-    stock = yf.Ticker(ticker_sym, session=_yf_session)
+    stock = yf.Ticker(ticker_sym)
     data = {}
 
     try:
@@ -585,7 +594,7 @@ if analyze_btn and company_name:
 
     # Step 2: Fetch market data
     with st.spinner("📊 Fetching live market data..."):
-        stock = yf.Ticker(ticker_sym, session=_yf_session)
+        stock = yf.Ticker(ticker_sym)
         df = safe_download(ticker_sym, start=start_date, end=end_date)
         info = safe_get_info(stock)  # Rate-limit safe with retries
 
