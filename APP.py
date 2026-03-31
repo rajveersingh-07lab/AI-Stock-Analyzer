@@ -27,6 +27,18 @@ gemini_client = None
 if GEMINI_API_KEY and GEMINI_API_KEY != "PASTE_YOUR_GEMINI_API_KEY_HERE":
     gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
+# ─── Fix Yahoo Finance Rate Limiting on Cloud ────────────
+# Create a custom session with browser-like headers to avoid IP blocks
+_yf_session = requests.Session()
+_yf_session.headers.update({
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.5',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Connection': 'keep-alive',
+    'Upgrade-Insecure-Requests': '1',
+})
+
 # ─── Page Config ──────────────────────────────────────────
 st.set_page_config(page_title="AI Stock Analyzer", layout="wide", page_icon="📈")
 
@@ -167,35 +179,72 @@ with st.sidebar:
 
 # ─── Helper Functions ────────────────────────────────────
 
-def safe_get_info(ticker_obj, max_retries=3):
-    """Safely fetch stock.info with retry + exponential backoff for rate limits."""
+def safe_yf_call(func, *args, max_retries=3, default=None, **kwargs):
+    """Safely call any yfinance function with retry + exponential backoff."""
     for attempt in range(max_retries):
         try:
-            return ticker_obj.info
+            return func(*args, **kwargs)
         except Exception as e:
-            error_name = type(e).__name__
-            if 'RateLimit' in error_name or 'rate' in str(e).lower():
-                wait_time = (2 ** attempt) * 2  # 2s, 4s, 8s
+            error_str = f"{type(e).__name__}: {e}"
+            if 'RateLimit' in error_str or 'rate' in error_str.lower() or 'Too Many Requests' in error_str:
+                wait_time = (2 ** attempt) * 3  # 3s, 6s, 12s
                 time.sleep(wait_time)
                 continue
             else:
-                # Non-rate-limit error, don't retry
-                return {}
-    return {}  # All retries exhausted
+                return default if default is not None else {}
+    return default if default is not None else {}
+
+
+def safe_get_info(ticker_obj, max_retries=3):
+    """Safely fetch stock.info with retry + exponential backoff for rate limits."""
+    return safe_yf_call(lambda: ticker_obj.info, max_retries=max_retries, default={})
+
+
+def safe_download(ticker_sym, start, end, max_retries=3):
+    """Safely call yf.download with retry logic."""
+    for attempt in range(max_retries):
+        try:
+            df = yf.download(ticker_sym, start=start, end=end, auto_adjust=True, session=_yf_session)
+            if df is not None and not df.empty:
+                return df
+        except Exception as e:
+            error_str = f"{type(e).__name__}: {e}"
+            if 'RateLimit' in error_str or 'rate' in error_str.lower():
+                wait_time = (2 ** attempt) * 3
+                time.sleep(wait_time)
+                continue
+            else:
+                return pd.DataFrame()
+    return pd.DataFrame()
 
 
 @st.cache_data(ttl=300, show_spinner=False)
 def get_ticker(company):
     """Auto-find stock ticker from company name using yfinance search."""
     try:
-        search = yf.Search(company, max_results=10)
-        results = search.quotes if hasattr(search, 'quotes') else []
+        # Try yfinance Search with retry
+        search = None
+        for attempt in range(3):
+            try:
+                search = yf.Search(company, max_results=10)
+                break
+            except Exception as e:
+                if 'RateLimit' in str(type(e).__name__) or 'rate' in str(e).lower():
+                    time.sleep((2 ** attempt) * 3)
+                    continue
+                break
+
+        results = []
+        if search:
+            results = search.quotes if hasattr(search, 'quotes') else []
+
         for r in results:
             if r.get('quoteType') in ['EQUITY', 'ETF']:
                 return r['symbol'], r.get('shortname', r.get('longname', company))
+
         # Fallback: try direct ticker lookup
         if not results:
-            test = yf.Ticker(company.upper().replace(" ", ""))
+            test = yf.Ticker(company.upper().replace(" ", ""), session=_yf_session)
             fallback_info = safe_get_info(test)
             if fallback_info.get('symbol'):
                 return fallback_info['symbol'], fallback_info.get('shortName', company)
@@ -227,7 +276,7 @@ def fetch_news_headlines(company_name, ticker_sym):
     """Fetch recent news headlines for the company."""
     headlines = []
     try:
-        stock = yf.Ticker(ticker_sym)
+        stock = yf.Ticker(ticker_sym, session=_yf_session)
         news = stock.news if hasattr(stock, 'news') else []
         if news:
             for item in news[:8]:
@@ -272,7 +321,7 @@ def fetch_news_headlines(company_name, ticker_sym):
 @st.cache_data(ttl=300, show_spinner=False)
 def get_financial_details(ticker_sym):
     """Fetch deep financial data for agentic analysis."""
-    stock = yf.Ticker(ticker_sym)
+    stock = yf.Ticker(ticker_sym, session=_yf_session)
     data = {}
 
     try:
@@ -536,8 +585,8 @@ if analyze_btn and company_name:
 
     # Step 2: Fetch market data
     with st.spinner("📊 Fetching live market data..."):
-        stock = yf.Ticker(ticker_sym)
-        df = yf.download(ticker_sym, start=start_date, end=end_date, auto_adjust=True)
+        stock = yf.Ticker(ticker_sym, session=_yf_session)
+        df = safe_download(ticker_sym, start=start_date, end=end_date)
         info = safe_get_info(stock)  # Rate-limit safe with retries
 
     if df.empty:
