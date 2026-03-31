@@ -206,7 +206,7 @@ def safe_yf_call(func, *args, max_retries=3, default=None, **kwargs):
 
 def safe_get_info(ticker_obj, max_retries=3):
     """Safely fetch stock.info with retry + exponential backoff for rate limits."""
-    return safe_yf_call(lambda: ticker_obj.info, max_retries=max_retries, default={})
+    return safe_yf_call(lambda: ticker_obj.info or {}, max_retries=max_retries, default={})
 
 
 def safe_download(ticker_sym, start, end, max_retries=3):
@@ -596,7 +596,7 @@ if analyze_btn and company_name:
     with st.spinner("📊 Fetching live market data..."):
         stock = yf.Ticker(ticker_sym)
         df = safe_download(ticker_sym, start=start_date, end=end_date)
-        info = safe_get_info(stock)  # Rate-limit safe with retries
+        info = safe_get_info(stock) or {}  # Ensure info is always a dict
 
     if df.empty:
         st.error("📉 No data found for this date range. Try expanding the date range.")
