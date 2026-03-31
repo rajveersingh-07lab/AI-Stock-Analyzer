@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import json
 import datetime
+import time
 import requests
 import os
 from dotenv import load_dotenv
@@ -166,6 +167,24 @@ with st.sidebar:
 
 # ─── Helper Functions ────────────────────────────────────
 
+def safe_get_info(ticker_obj, max_retries=3):
+    """Safely fetch stock.info with retry + exponential backoff for rate limits."""
+    for attempt in range(max_retries):
+        try:
+            return ticker_obj.info
+        except Exception as e:
+            error_name = type(e).__name__
+            if 'RateLimit' in error_name or 'rate' in str(e).lower():
+                wait_time = (2 ** attempt) * 2  # 2s, 4s, 8s
+                time.sleep(wait_time)
+                continue
+            else:
+                # Non-rate-limit error, don't retry
+                return {}
+    return {}  # All retries exhausted
+
+
+@st.cache_data(ttl=300, show_spinner=False)
 def get_ticker(company):
     """Auto-find stock ticker from company name using yfinance search."""
     try:
@@ -177,8 +196,9 @@ def get_ticker(company):
         # Fallback: try direct ticker lookup
         if not results:
             test = yf.Ticker(company.upper().replace(" ", ""))
-            if test.info.get('symbol'):
-                return test.info['symbol'], test.info.get('shortName', company)
+            fallback_info = safe_get_info(test)
+            if fallback_info.get('symbol'):
+                return fallback_info['symbol'], fallback_info.get('shortName', company)
         return None, None
     except Exception as e:
         st.warning(f"Search issue: {e}")
@@ -249,13 +269,14 @@ def fetch_news_headlines(company_name, ticker_sym):
     return headlines[:8]
 
 
+@st.cache_data(ttl=300, show_spinner=False)
 def get_financial_details(ticker_sym):
     """Fetch deep financial data for agentic analysis."""
     stock = yf.Ticker(ticker_sym)
     data = {}
 
     try:
-        info = stock.info
+        info = safe_get_info(stock)
         data['financials'] = {
             'revenue': info.get('totalRevenue', 'N/A'),
             'gross_margins': info.get('grossMargins', 'N/A'),
@@ -517,7 +538,7 @@ if analyze_btn and company_name:
     with st.spinner("📊 Fetching live market data..."):
         stock = yf.Ticker(ticker_sym)
         df = yf.download(ticker_sym, start=start_date, end=end_date, auto_adjust=True)
-        info = stock.info
+        info = safe_get_info(stock)  # Rate-limit safe with retries
 
     if df.empty:
         st.error("📉 No data found for this date range. Try expanding the date range.")
@@ -535,10 +556,14 @@ if analyze_btn and company_name:
     volatility = float(np.std(daily_return.dropna()) * np.sqrt(252))
     rsi = calculate_rsi(close)
 
+    # Graceful fallback: if info is empty (rate limited), use historical data
     current_price = info.get('currentPrice') or info.get('regularMarketPrice') or float(close.iloc[-1])
     high_52w = info.get('fiftyTwoWeekHigh') or float(close.max())
     low_52w = info.get('fiftyTwoWeekLow') or float(close.min())
     rsi_val = float(rsi.iloc[-1]) if not np.isnan(rsi.iloc[-1]) else 50.0
+
+    if not info:
+        st.warning("⚠️ Yahoo Finance rate limit hit — using historical data for metrics. Analysis will still proceed.")
 
     metrics = {
         'current_price': current_price,
